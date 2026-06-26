@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { initializeApp } from "firebase/app";
-import { getDatabase, ref, set, onValue } from "firebase/database";
+import { getDatabase, ref, set, update, get, onValue } from "firebase/database";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCVb0l_GtlZFONVEZfwEHa2-YKbJ7kfQQM",
@@ -14,7 +14,31 @@ const firebaseConfig = {
 
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getDatabase(firebaseApp);
-const GAME_REF = ref(db, "wc2026/game");
+const ROOMS_PATH = "wc2026/rooms";
+const roomRef = (code: string) => ref(db, `${ROOMS_PATH}/${code}`);
+
+// localStorage keys (scoped per room where relevant)
+const LS_ROOM  = "wc2026_room";
+const lsName   = (code: string) => `wc2026_name_${code}`;
+const lsAdmin  = (code: string) => `wc2026_admin_${code}`;
+
+const CODE_WORDS = [
+  "TIGER","EAGLE","SHARK","LION","WOLF","BEAR","HAWK","PUMA","COBRA","FALCON",
+  "PANDA","RHINO","BISON","OTTER","MOOSE","LYNX","ORCA","RAVEN","VIPER","GECKO"
+];
+
+const genRoomCode = async (): Promise<string> => {
+  const snap = await get(ref(db, ROOMS_PATH));
+  const existing = (snap.val() as Record<string, unknown>) || {};
+  let code = "";
+  for (let i = 0; i < 50; i++) {
+    const w = CODE_WORDS[Math.floor(Math.random() * CODE_WORDS.length)];
+    const num = String(Math.floor(Math.random() * 100)).padStart(2, "0");
+    code = `${w}-${num}`;
+    if (!existing[code]) break;
+  }
+  return code;
+};
 
 const TEAM_FLAGS: Record<string, string> = {
   "Albania":"🇦🇱","Argentina":"🇦🇷","Australia":"🇦🇺","Austria":"🇦🇹",
@@ -76,8 +100,17 @@ const calcScores = (players: string[], picks: Record<string, string[]>, results:
   }).sort((a, b) => b.total - a.total);
 
 export default function App() {
-  const [phase,        setPhase]        = useState("setup");
+  // -- Room / device state --
+  const [roomCode,  setRoomCode]  = useState<string | null>(null);
+  const [screen,    setScreen]    = useState<"home" | "create" | "join">("home");
+  const [joinInput, setJoinInput] = useState("");
+  const [joinError, setJoinError] = useState("");
+  const [myName,    setMyName]    = useState<string | null>(null);
+
+  // -- Game state (synced from the room) --
+  const [phase,        setPhase]        = useState("lobby");
   const [players,      setPlayers]      = useState<string[]>([]);
+  const [joined,       setJoined]       = useState<Record<string, boolean>>({});
   const [newName,      setNewName]      = useState("");
   const [n,            setN]            = useState(2);
   const [picks,        setPicks]        = useState<Record<string, string[]>>({});
@@ -93,29 +126,105 @@ export default function App() {
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(""), 2500); };
 
-  // Real-time listener - fires for ALL connected users when anything changes
+  // On mount: restore room from URL (?room=CODE) or localStorage
   useEffect(() => {
-    const unsubscribe = onValue(GAME_REF, (snapshot) => {
+    let saved: string | null = null;
+    try {
+      const fromUrl = new URL(window.location.href).searchParams.get("room");
+      saved = fromUrl ? fromUrl.toUpperCase() : localStorage.getItem(LS_ROOM);
+    } catch { saved = null; }
+    if (saved) {
+      setRoomCode(saved);
+      try {
+        setMyName(localStorage.getItem(lsName(saved)));
+        setAdmin(localStorage.getItem(lsAdmin(saved)) === "1");
+      } catch { /* ignore */ }
+    } else {
+      setLoading(false);
+    }
+  }, []);
+
+  // Real-time listener — re-subscribes whenever the room changes
+  useEffect(() => {
+    if (!roomCode) { setLoading(false); return; }
+    setLoading(true);
+    const r = roomRef(roomCode);
+    const unsubscribe = onValue(r, (snapshot) => {
       const d = snapshot.val();
       if (d) {
-        if (d.phase   !== undefined) setPhase(d.phase);
-        if (d.players !== undefined) setPlayers(d.players);
-        if (d.n       !== undefined) setN(d.n);
-        if (d.picks   !== undefined) setPicks(d.picks);
-        if (d.order   !== undefined) setOrder(d.order);
-        if (d.step    !== undefined) setStep(d.step);
-        if (d.results !== undefined) setResults(d.results);
+        setPhase(d.phase ?? "lobby");
+        setPlayers(d.players ?? []);
+        setN(d.n ?? 2);
+        setPicks(d.picks ?? {});
+        setOrder(d.order ?? []);
+        setStep(d.step ?? 0);
+        setResults(d.results ?? {});
+        setJoined(d.joined ?? {});
       }
       setLoading(false);
     });
     return () => unsubscribe();
-  }, []);
+  }, [roomCode]);
 
-  const persist = (patch: Record<string, any> = {}) => {
-    const d = { phase, players, n, picks, order, step, results, ...patch };
-    set(GAME_REF, d)
+  const persist = (patch: Record<string, unknown> = {}) => {
+    if (!roomCode) return;
+    update(roomRef(roomCode), patch)
       .then(() => showToast("Saved ✓"))
       .catch(() => showToast("Save failed"));
+  };
+
+  // -- Room handlers --
+  const createRoom = async () => {
+    if (players.length < 2) return;
+    setLoading(true);
+    const code = await genRoomCode();
+    const room = {
+      phase: "lobby", players, n, picks: {}, order: [], step: 0, results: {},
+      joined: {}, meta: { created: Date.now() }
+    };
+    await set(roomRef(code), room);
+    try {
+      localStorage.setItem(LS_ROOM, code);
+      localStorage.setItem(lsAdmin(code), "1");
+    } catch { /* ignore */ }
+    setAdmin(true);
+    setRoomCode(code);
+    setScreen("home");
+  };
+
+  const joinRoom = async () => {
+    const code = joinInput.trim().toUpperCase();
+    if (!code) return;
+    const snap = await get(roomRef(code));
+    if (!snap.exists()) { setJoinError("No room with that code"); return; }
+    try {
+      localStorage.setItem(LS_ROOM, code);
+      setMyName(localStorage.getItem(lsName(code)));
+      setAdmin(localStorage.getItem(lsAdmin(code)) === "1");
+    } catch { /* ignore */ }
+    setJoinError(""); setJoinInput("");
+    setRoomCode(code);
+    setScreen("home");
+  };
+
+  const claimName = (name: string) => {
+    if (!roomCode) return;
+    setMyName(name);
+    try { localStorage.setItem(lsName(roomCode), name); } catch { /* ignore */ }
+    persist({ [`joined/${name}`]: true });
+  };
+
+  const leaveRoom = () => {
+    try { if (roomCode) localStorage.removeItem(LS_ROOM); } catch { /* ignore */ }
+    setRoomCode(null); setMyName(null); setAdmin(false); setConfirmReset(false);
+    setScreen("home");
+  };
+
+  const copyCode = async () => {
+    if (!roomCode) return;
+    const shareUrl = `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
+    try { await navigator.clipboard.writeText(shareUrl); showToast("Invite link copied ✓"); }
+    catch { showToast(roomCode); }
   };
 
   if (loading) return (
@@ -127,6 +236,148 @@ export default function App() {
     </div>
   );
 
+  // ========== NO ROOM: HOME / CREATE / JOIN ==========
+  if (!roomCode) {
+    // -- HOME --
+    if (screen === "home") return (
+      <div className="min-h-screen bg-gray-950 text-white p-4">
+        <div className="max-w-md mx-auto pt-16 pb-12">
+          <div className="text-center mb-10">
+            <div className="text-6xl mb-3">⚽</div>
+            <h1 className="text-4xl font-black tracking-tight">WC 2026</h1>
+            <p className="text-gray-400 mt-1 text-sm">Draft Predictor · Snake Format</p>
+          </div>
+          <div className="space-y-3">
+            <button
+              onClick={() => setScreen("create")}
+              className="w-full py-4 bg-green-600 hover:bg-green-500 rounded-2xl font-black text-lg transition-all shadow-lg"
+            >
+              ➕ Create a Room
+            </button>
+            <button
+              onClick={() => setScreen("join")}
+              className="w-full py-4 bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-2xl font-black text-lg transition-all"
+            >
+              🔑 Join with a Code
+            </button>
+          </div>
+          <p className="text-center text-gray-600 text-xs mt-8">
+            Create a room, share the code, everyone drafts from their own phone.
+          </p>
+        </div>
+      </div>
+    );
+
+    // -- JOIN --
+    if (screen === "join") return (
+      <div className="min-h-screen bg-gray-950 text-white p-4">
+        <div className="max-w-md mx-auto pt-12 pb-12">
+          <button onClick={() => { setScreen("home"); setJoinError(""); }} className="text-gray-500 hover:text-white text-sm mb-6">← Back</button>
+          <h1 className="text-2xl font-black mb-1">Join a Room</h1>
+          <p className="text-gray-400 text-sm mb-6">Enter the code the host shared with you.</p>
+          <input
+            value={joinInput}
+            onChange={e => { setJoinInput(e.target.value.toUpperCase()); setJoinError(""); }}
+            onKeyDown={e => e.key === "Enter" && joinRoom()}
+            placeholder="e.g. TIGER-42"
+            className="w-full bg-gray-900 border border-gray-800 rounded-xl px-4 py-3 text-white text-center text-xl font-black tracking-widest placeholder-gray-700 outline-none mb-2 focus:ring-2 focus:ring-green-500"
+          />
+          {joinError && <p className="text-red-400 text-sm mb-2 text-center">{joinError}</p>}
+          <button
+            onClick={joinRoom}
+            disabled={!joinInput.trim()}
+            className="w-full py-3.5 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 rounded-2xl font-black text-lg transition-all mt-2"
+          >
+            Join Room
+          </button>
+        </div>
+      </div>
+    );
+
+    // -- CREATE (setup) --
+    const addPlayer = () => {
+      const name = newName.trim();
+      if (!name || players.includes(name)) return;
+      setPlayers(p => [...p, name]);
+      setNewName("");
+    };
+    return (
+      <div className="min-h-screen bg-gray-950 text-white p-4">
+        <div className="max-w-md mx-auto pt-6 pb-12">
+          <button onClick={() => setScreen("home")} className="text-gray-500 hover:text-white text-sm mb-4">← Back</button>
+          <div className="text-center mb-8">
+            <div className="text-5xl mb-2">⚽</div>
+            <h1 className="text-3xl font-black tracking-tight">New Room</h1>
+            <p className="text-gray-400 mt-1 text-sm">Add the players, then create your room</p>
+          </div>
+
+          <div className="bg-gray-900 rounded-2xl p-5 mb-4 border border-gray-800">
+            <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Players</p>
+            <div className="flex gap-2 mb-3">
+              <input
+                value={newName}
+                onChange={e => setNewName(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && addPlayer()}
+                placeholder="Enter name..."
+                className="flex-1 bg-gray-800 rounded-xl px-4 py-2.5 outline-none text-white placeholder-gray-600 focus:ring-2 focus:ring-green-500"
+              />
+              <button onClick={addPlayer} className="bg-green-600 hover:bg-green-500 px-4 rounded-xl font-black text-xl transition-colors">+</button>
+            </div>
+            <div className="space-y-2">
+              {players.map((p, i) => (
+                <div key={p} className={`flex items-center justify-between px-4 py-2.5 rounded-xl ${PC[i%PC.length].light} border ${PC[i%PC.length].border}`}>
+                  <div className="flex items-center gap-2">
+                    <span className={`w-5 h-5 rounded-full ${PC[i%PC.length].bg} text-white text-xs flex items-center justify-center font-bold`}>{i+1}</span>
+                    <span className={`font-semibold ${PC[i%PC.length].text}`}>{p}</span>
+                  </div>
+                  <button onClick={() => setPlayers(pl => pl.filter(x => x !== p))} className="text-gray-400 hover:text-red-400 text-xl font-light leading-none">×</button>
+                </div>
+              ))}
+              {players.length === 0 && <p className="text-center text-gray-600 text-sm py-2">Add at least 2 players to start</p>}
+            </div>
+          </div>
+
+          <div className="bg-gray-900 rounded-2xl p-5 mb-4 border border-gray-800">
+            <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Picks per player</p>
+            <div className="flex gap-2">
+              {[1,2,3].map(v => (
+                <button
+                  key={v}
+                  onClick={() => setN(v)}
+                  className={`flex-1 py-3 rounded-xl font-black text-2xl transition-all ${n === v ? "bg-green-600 text-white shadow-lg" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}
+                >{v}</button>
+              ))}
+            </div>
+            <p className="text-gray-600 text-xs mt-2 text-center">
+              Snake draft · {players.length}p × {n} = {players.length * n} total picks
+            </p>
+          </div>
+
+          <div className="bg-gray-900 rounded-2xl p-5 mb-6 border border-gray-800">
+            <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Points System (2026 Format)</p>
+            <div className="grid grid-cols-2 gap-2">
+              {ROUNDS.map(r => (
+                <div key={r.id} className="flex items-center justify-between bg-gray-800 rounded-xl px-3 py-2">
+                  <span className="text-xs text-gray-300">{r.label}</span>
+                  <span className="font-black text-green-400">{r.pts}pt</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <button
+            onClick={createRoom}
+            disabled={players.length < 2}
+            className="w-full py-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed rounded-2xl font-black text-xl transition-all shadow-lg"
+          >
+            ➕ Create Room
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ========== IN A ROOM ==========
   // -- Computed --
   const allPicked   = Object.values(picks).flat();
   const available   = TEAMS.filter(t => !allPicked.includes(t) && t.toLowerCase().includes(search.toLowerCase()));
@@ -136,40 +387,31 @@ export default function App() {
   const cc          = curIdx >= 0 ? PC[curIdx % PC.length] : null;
   const medals      = ["🥇","🥈","🥉"];
   const pickedTeams = Object.values(picks).flat();
+  const isMyTurn    = !!curPlayer && myName === curPlayer;
+  const canPick     = isMyTurn || admin;
 
   // -- Handlers --
-  const addPlayer = () => {
-    const name = newName.trim();
-    if (!name || players.includes(name)) return;
-    setPlayers(p => [...p, name]);
-    setNewName("");
-  };
-
   const startDraft = () => {
     const ord = snake(players, n);
     const initPicks = Object.fromEntries(players.map(p => [p, []]));
-    setOrder(ord); setStep(0); setPicks(initPicks); setPhase("draft");
     persist({ order: ord, step: 0, picks: initPicks, phase: "draft" });
   };
 
   const makePick = (team: string) => {
     if (step >= order.length) return;
+    if (!canPick) return;
     const player = order[step];
     const newPicks = { ...picks, [player]: [...(picks[player] || []), team] };
     const ns = step + 1;
     const np = ns >= order.length ? "live" : "draft";
-    setPicks(newPicks); setStep(ns);
-    if (np === "live") { setPhase("live"); setTab("leaderboard"); }
     persist({ picks: newPicks, step: ns, phase: np });
   };
 
   const undoPick = () => {
-    if (step === 0) return;
+    if (step === 0 || !admin) return;
     const ps = step - 1;
     const pp = order[ps];
     const newPicks = { ...picks, [pp]: (picks[pp] || []).slice(0, -1) };
-    setStep(ps); setPicks(newPicks);
-    if (phase === "live") setPhase("draft");
     persist({ picks: newPicks, step: ps, phase: "draft" });
   };
 
@@ -181,92 +423,81 @@ export default function App() {
       nr = { ...results };
       delete nr[team];
     }
-    setResults(nr);
     persist({ results: nr });
   };
 
-  const reset = () => {
-    const blank = { phase:"setup", players:[], n:2, picks:{}, order:[], step:0, results:{} };
-    set(GAME_REF, blank).then(() => showToast("Game reset"));
-    setPhase("setup"); setPlayers([]); setN(2); setPicks({});
-    setOrder([]); setStep(0); setResults({}); setConfirmReset(false); setAdmin(false);
+  const resetGame = () => {
+    persist({ phase: "lobby", picks: {}, order: [], step: 0, results: {} });
+    setConfirmReset(false); setAdmin(admin); setTab("leaderboard");
   };
 
-  // ========== SETUP ==========
-  if (phase === "setup") return (
+  // Small shared header bar for in-room screens
+  const RoomBar = () => (
+    <div className="flex items-center justify-between mb-4">
+      <button onClick={copyCode} className="flex items-center gap-2 bg-gray-900 border border-gray-800 hover:border-green-700 rounded-full px-3 py-1.5 transition-colors">
+        <span className="text-xs text-gray-500 font-bold uppercase tracking-wide">Room</span>
+        <span className="text-sm font-black tracking-widest text-green-400">{roomCode}</span>
+        <span className="text-xs text-gray-600">📋</span>
+      </button>
+      <button onClick={leaveRoom} className="text-xs text-gray-500 hover:text-red-400 transition-colors">Leave ↩</button>
+    </div>
+  );
+
+  // ========== LOBBY ==========
+  if (phase === "lobby") return (
     <div className="min-h-screen bg-gray-950 text-white p-4">
-      <div className="max-w-md mx-auto pt-6 pb-12">
-        <div className="text-center mb-8">
-          <div className="text-6xl mb-3">⚽</div>
-          <h1 className="text-4xl font-black tracking-tight">WC 2026</h1>
-          <p className="text-gray-400 mt-1 text-sm">Draft Predictor · Snake Format</p>
-          <div className="mt-2 inline-flex items-center gap-1.5 bg-green-950 border border-green-800 text-green-400 text-xs px-3 py-1 rounded-full">
-            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block"></span>
-            Live sync enabled
-          </div>
+      <div className="max-w-md mx-auto pt-4 pb-12">
+        <RoomBar />
+
+        <div className="text-center mb-6">
+          <div className="text-5xl mb-2">⚽</div>
+          <h1 className="text-2xl font-black tracking-tight">Lobby</h1>
+          <p className="text-gray-400 text-sm mt-1">Tap your name below to claim it on this phone.</p>
         </div>
 
-        <div className="bg-gray-900 rounded-2xl p-5 mb-4 border border-gray-800">
-          <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Players</p>
-          <div className="flex gap-2 mb-3">
-            <input
-              value={newName}
-              onChange={e => setNewName(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && addPlayer()}
-              placeholder="Enter name..."
-              className="flex-1 bg-gray-800 rounded-xl px-4 py-2.5 outline-none text-white placeholder-gray-600 focus:ring-2 focus:ring-green-500"
-            />
-            <button onClick={addPlayer} className="bg-green-600 hover:bg-green-500 px-4 rounded-xl font-black text-xl transition-colors">+</button>
-          </div>
+        <div className="bg-green-950 border border-green-800 rounded-2xl p-4 mb-4 text-center">
+          <p className="text-xs text-green-500 font-bold uppercase tracking-widest mb-1">Share this code</p>
+          <p className="text-3xl font-black tracking-widest text-green-400">{roomCode}</p>
+          <button onClick={copyCode} className="mt-2 text-xs bg-green-800 hover:bg-green-700 text-green-100 px-3 py-1.5 rounded-full font-bold transition-colors">📋 Copy invite link</button>
+        </div>
+
+        <div className="bg-gray-900 rounded-2xl p-4 mb-4 border border-gray-800">
+          <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Who's in</p>
           <div className="space-y-2">
-            {players.map((p, i) => (
-              <div key={p} className={`flex items-center justify-between px-4 py-2.5 rounded-xl ${PC[i%PC.length].light} border ${PC[i%PC.length].border}`}>
-                <div className="flex items-center gap-2">
-                  <span className={`w-5 h-5 rounded-full ${PC[i%PC.length].bg} text-white text-xs flex items-center justify-center font-bold`}>{i+1}</span>
-                  <span className={`font-semibold ${PC[i%PC.length].text}`}>{p}</span>
-                </div>
-                <button onClick={() => setPlayers(pl => pl.filter(x => x !== p))} className="text-gray-400 hover:text-red-400 text-xl font-light leading-none">×</button>
-              </div>
-            ))}
-            {players.length === 0 && <p className="text-center text-gray-600 text-sm py-2">Add at least 2 players to start</p>}
+            {players.map((p, i) => {
+              const c = PC[i % PC.length];
+              const isMe = myName === p;
+              const hasJoined = !!joined[p];
+              return (
+                <button
+                  key={p}
+                  onClick={() => claimName(p)}
+                  className={`w-full flex items-center justify-between px-4 py-3 rounded-xl border transition-all ${isMe ? c.bg + " border-transparent text-white" : c.light + " " + c.border}`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className={`w-5 h-5 rounded-full ${isMe ? "bg-white/25" : c.bg} text-white text-xs flex items-center justify-center font-bold`}>{i+1}</span>
+                    <span className={`font-bold ${isMe ? "text-white" : c.text}`}>{p}</span>
+                  </div>
+                  <span className={`text-xs font-bold ${isMe ? "text-white" : hasJoined ? "text-green-600" : "text-gray-400"}`}>
+                    {isMe ? "This is me ✓" : hasJoined ? "Joined ✓" : "Tap to claim"}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        <div className="bg-gray-900 rounded-2xl p-5 mb-4 border border-gray-800">
-          <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Picks per player</p>
-          <div className="flex gap-2">
-            {[1,2,3].map(v => (
-              <button
-                key={v}
-                onClick={() => setN(v)}
-                className={`flex-1 py-3 rounded-xl font-black text-2xl transition-all ${n === v ? "bg-green-600 text-white shadow-lg" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}
-              >{v}</button>
-            ))}
-          </div>
-          <p className="text-gray-600 text-xs mt-2 text-center">
-            Snake draft · {players.length}p × {n} = {players.length * n} total picks
-          </p>
-        </div>
-
-        <div className="bg-gray-900 rounded-2xl p-5 mb-6 border border-gray-800">
-          <p className="text-xs text-gray-500 font-bold uppercase tracking-widest mb-3">Points System (2026 Format)</p>
-          <div className="grid grid-cols-2 gap-2">
-            {ROUNDS.map(r => (
-              <div key={r.id} className="flex items-center justify-between bg-gray-800 rounded-xl px-3 py-2">
-                <span className="text-xs text-gray-300">{r.label}</span>
-                <span className="font-black text-green-400">{r.pts}pt</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <button
-          onClick={startDraft}
-          disabled={players.length < 2}
-          className="w-full py-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed rounded-2xl font-black text-xl transition-all shadow-lg"
-        >
-          🚀 Start Draft
-        </button>
+        {admin ? (
+          <button
+            onClick={startDraft}
+            disabled={players.length < 2}
+            className="w-full py-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 rounded-2xl font-black text-xl transition-all shadow-lg"
+          >
+            🚀 Start Draft
+          </button>
+        ) : (
+          <p className="text-center text-gray-500 text-sm py-3">Waiting for the host to start the draft…</p>
+        )}
       </div>
     </div>
   );
@@ -277,11 +508,12 @@ export default function App() {
     return (
       <div className="min-h-screen bg-gray-950 text-white p-4 pb-8">
         <div className="max-w-md mx-auto">
-          <div className="flex items-center justify-between pt-4 mb-4">
+          <RoomBar />
+          <div className="flex items-center justify-between mb-4">
             <h1 className="font-black text-xl">⚽ Snake Draft</h1>
             <div className="flex items-center gap-2">
               <span className="text-gray-500 text-sm">{step}/{order.length}</span>
-              {step > 0 && (
+              {admin && step > 0 && (
                 <button onClick={undoPick} className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg transition-colors">
                   ↩ Undo
                 </button>
@@ -294,10 +526,16 @@ export default function App() {
           </div>
 
           {curPlayer && cc && (
-            <div className={`rounded-2xl p-4 mb-4 ${cc.light} border ${cc.border}`}>
-              <p className="text-gray-500 text-xs font-bold uppercase tracking-wide">Now picking</p>
-              <p className={`text-2xl font-black ${cc.text}`}>{curPlayer}</p>
-              <p className="text-gray-400 text-xs mt-0.5">Pick {(picks[curPlayer]||[]).length + 1} of {n}</p>
+            <div className={`rounded-2xl p-4 mb-4 ${isMyTurn ? cc.bg + " text-white" : cc.light + " border " + cc.border}`}>
+              <p className={`text-xs font-bold uppercase tracking-wide ${isMyTurn ? "text-white/80" : "text-gray-500"}`}>
+                {isMyTurn ? "Your turn" : "Now picking"}
+              </p>
+              <p className={`text-2xl font-black ${isMyTurn ? "text-white" : cc.text}`}>
+                {curPlayer}{isMyTurn ? " (you)" : ""}
+              </p>
+              <p className={`text-xs mt-0.5 ${isMyTurn ? "text-white/80" : "text-gray-400"}`}>
+                Pick {(picks[curPlayer]||[]).length + 1} of {n}
+              </p>
             </div>
           )}
 
@@ -338,25 +576,39 @@ export default function App() {
             </div>
           </div>
 
-          <input
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            placeholder="🔍 Search countries..."
-            className="w-full bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-white placeholder-gray-600 outline-none mb-3 focus:ring-2 focus:ring-green-500"
-          />
-
-          <div className="grid grid-cols-2 gap-2">
-            {available.map(team => (
-              <button
-                key={team}
-                onClick={() => makePick(team)}
-                className="bg-gray-900 hover:bg-gray-800 active:scale-95 border border-gray-800 hover:border-green-700 rounded-xl px-3 py-3 text-left transition-all flex items-center gap-2 group"
-              >
-                <span className="text-2xl">{TEAM_FLAGS[team]}</span>
-                <span className="text-sm font-semibold text-gray-200 group-hover:text-white">{team}</span>
-              </button>
-            ))}
-          </div>
+          {canPick ? (
+            <>
+              <input
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                placeholder="🔍 Search countries..."
+                className="w-full bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-white placeholder-gray-600 outline-none mb-3 focus:ring-2 focus:ring-green-500"
+              />
+              {admin && !isMyTurn && (
+                <p className="text-amber-400 text-xs mb-2 text-center">Admin override — picking for {curPlayer}</p>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                {available.map(team => (
+                  <button
+                    key={team}
+                    onClick={() => makePick(team)}
+                    className="bg-gray-900 hover:bg-gray-800 active:scale-95 border border-gray-800 hover:border-green-700 rounded-xl px-3 py-3 text-left transition-all flex items-center gap-2 group"
+                  >
+                    <span className="text-2xl">{TEAM_FLAGS[team]}</span>
+                    <span className="text-sm font-semibold text-gray-200 group-hover:text-white">{team}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="bg-gray-900 border border-gray-800 rounded-2xl p-8 text-center">
+              <div className="text-4xl mb-3 animate-pulse">⏳</div>
+              <p className="text-gray-300 font-bold">Waiting for {curPlayer} to pick…</p>
+              <p className="text-gray-600 text-xs mt-1">
+                {myName ? `You're playing as ${myName}. Your turn will light up here.` : "Tip: go back to the lobby and claim your name."}
+              </p>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -367,6 +619,13 @@ export default function App() {
     <div className="min-h-screen bg-gray-950 text-white">
       <div className="sticky top-0 z-20 bg-gray-950 border-b border-gray-800">
         <div className="max-w-md mx-auto px-4 py-3">
+          <div className="flex items-center justify-between mb-2">
+            <button onClick={copyCode} className="flex items-center gap-1.5 text-xs">
+              <span className="text-gray-500 font-bold uppercase tracking-wide">Room</span>
+              <span className="font-black tracking-widest text-green-400">{roomCode}</span>
+            </button>
+            <button onClick={leaveRoom} className="text-xs text-gray-500 hover:text-red-400 transition-colors">Leave ↩</button>
+          </div>
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <span className="text-xl">⚽</span>
@@ -509,13 +768,13 @@ export default function App() {
                     onClick={() => setConfirmReset(true)}
                     className="w-full py-3 border border-red-900 text-red-500 hover:bg-red-950 rounded-xl text-sm font-bold transition-colors"
                   >
-                    🗑️ Reset Game
+                    🗑️ Reset Draft (this room)
                   </button>
                 ) : (
                   <div>
-                    <p className="text-center text-sm text-gray-400 mb-3">Sure? This clears everything for everyone.</p>
+                    <p className="text-center text-sm text-gray-400 mb-3">Sure? This clears picks &amp; results for everyone in {roomCode} and returns to the lobby.</p>
                     <div className="flex gap-2">
-                      <button onClick={reset} className="flex-1 py-3 bg-red-700 hover:bg-red-600 rounded-xl text-sm font-bold transition-colors">Yes, reset</button>
+                      <button onClick={resetGame} className="flex-1 py-3 bg-red-700 hover:bg-red-600 rounded-xl text-sm font-bold transition-colors">Yes, reset</button>
                       <button onClick={() => setConfirmReset(false)} className="flex-1 py-3 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold transition-colors">Cancel</button>
                     </div>
                   </div>
