@@ -389,6 +389,8 @@ export default function App() {
   const pickedTeams = Object.values(picks).flat();
   const isMyTurn    = !!curPlayer && myName === curPlayer;
   const canPick     = isMyTurn || admin;
+  const unclaimed   = players.filter(p => !joined[p]);
+  const allClaimed  = players.length >= 2 && unclaimed.length === 0;
 
   // -- Handlers --
   const startDraft = () => {
@@ -488,13 +490,22 @@ export default function App() {
         </div>
 
         {admin ? (
-          <button
-            onClick={startDraft}
-            disabled={players.length < 2}
-            className="w-full py-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 rounded-2xl font-black text-xl transition-all shadow-lg"
-          >
-            🚀 Start Draft
-          </button>
+          <>
+            <button
+              onClick={startDraft}
+              disabled={!allClaimed}
+              className="w-full py-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed rounded-2xl font-black text-xl transition-all shadow-lg"
+            >
+              🚀 Start Draft
+            </button>
+            {!allClaimed && (
+              <p className="text-center text-amber-400 text-xs mt-2">
+                {players.length < 2
+                  ? "Add at least 2 players"
+                  : `Waiting for everyone to claim their name: ${unclaimed.join(", ")}`}
+              </p>
+            )}
+          </>
         ) : (
           <p className="text-center text-gray-500 text-sm py-3">Waiting for the host to start the draft…</p>
         )}
